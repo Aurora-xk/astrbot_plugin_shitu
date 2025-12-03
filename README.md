@@ -1,21 +1,23 @@
 # 🖼️ 动漫/Gal/二游图片识别插件
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-3.5.0-blue.svg" alt="版本">
+  <img src="https://img.shields.io/badge/version-3.6.0-blue.svg" alt="版本">
   <img src="https://img.shields.io/badge/python-3.8%2B-green.svg" alt="Python">
   <img src="https://img.shields.io/badge/license-MIT-orange.svg" alt="License">
   <img src="https://img.shields.io/badge/platform-AstrBot-purple.svg" alt="Platform">
 </p>
 
+
 ## 🎯 功能特色
 
-✨ **智能图片识别**: 基于 [AnimeTrace API](https://api.animetrace.com/)，识别动漫、GalGame、二次元游戏角色  
+✨ **智能图片识别**: 基于 [AnimeTrace](https://ai.animedb.cn/)，识别动漫、GalGame、二次元游戏角色  
 💡 **智能优化策略**: URL优先识别，失败自动回退到图片下载识别  
 🛡️ **完善的错误处理**: 30秒超时保护，异常捕获，优雅降级  
 📝 **引用消息支持**: 可以识别引用消息中的图片  
 🎨 **美观的结果展示**: 清晰的格式化输出，支持多结果显示  
+🖼️ **角色图片返回**: 可选按识别框裁剪角色区域，并发送多张角色图片  
 🆕 **智能头像识别**: 支持@用户、手动输入QQ号、自动识别自己头像  
-⚙️ **可配置化**: 支持自定义超时时间和提示文字
+⚙️ **可配置化**: 支持自定义超时时间、提示文字、Markdown 输出以及是否发送角色图片
 
 ## 📋 识别模型说明
 
@@ -97,13 +99,14 @@
 - **⏰ 超时保护**: 30秒等待期限，防止无限等待（支持自定义配置）
 - **🔄 自动重试**: URL识别失败自动回退到base64方式
 - **💥 异常捕获**: 所有API调用都有try-except保护
-- **📝 详细日志**: 完整的操作日志便于调试
+- **📝 适度日志**: 保留关键错误与核心流程日志，去除多余debug输出，避免刷屏
 
 ### ⚙️ 配置选项
 通过 `_conf_schema.json` 文件支持以下配置：
 - **超时时间**: 自定义等待用户发送图片的超时时间（默认30秒）
 - **提示文字**: 自定义提示用户发送图片的文字
 - **超时提示**: 自定义超时后的提示文字
+- **角色图片返回**: 是否在文字结果后发送裁剪出的角色图片，以及最多发送几张
 
 ### 🎨 多平台支持
 
@@ -118,6 +121,17 @@
 **✅ 支持** | **❌ 不支持** | **❓ 部分支持/待测试**
 
 ## 📋 更新日志
+
+### 📅 2025年12月2日 - v3.6.0
+#### 🐛 Bug 修复
+- 修复 AnimeTrace 返回多个角色框时，仅展示第一组角色的异常，现在会按每个角色单独分组展示结果。
+
+#### ✨ 新增功能
+- 新增可选的「发送裁剪角色图片」功能，可根据识别结果的 box 裁剪人物区域并发送图片。
+- 新增配置项 `return_crops`（是否发送裁剪图片）与 `max_crops`（每次最多发送的裁剪图片数量）。
+
+#### 🔧 其他改动
+- 去除部分无用或过于频繁的 debug 日志，仅保留关键错误与核心流程日志，减少控制台刷屏。
 
 ### 📅 2025年10月10日 - v3.5.0
 #### ✨ 新增功能
@@ -143,6 +157,9 @@
 | `timeout_seconds` | 等待用户发送图片的超时时间 | 30 | 20-60秒 |
 | `prompt_send_image` | 提示用户发送图片的文字 | "📷 请发送要识别的图片（30秒内有效）" | 支持emoji |
 | `prompt_timeout` | 用户超时后的提示文字 | "⏰ 识别请求已超时，请重新发送命令" | 支持emoji |
+| `use_markdown` | 是否使用 Markdown 格式输出结果 | true | true/false |
+| `return_crops` | 是否在文字结果后发送裁剪出的角色图片 | true | true/false |
+| `max_crops` | 每次识别最多发送的裁剪图片数量 | 5 | 建议5 |
 
 ### 💡 配置示例
 你可以根据需要自定义提示文字，比如：
@@ -162,7 +179,7 @@
 <p align="center">
   <b>🎨 让每一张二次元图片都能找到它的归属 🎨</b>
 </p>
-
 <p align="center">
-  <i>Powered by <a href="https://api.animetrace.com/">AnimeTrace API</a> | Made with ❤️ for AstrBot</i>
+  <i>Powered by <a href="https://ai.animedb.cn/">AnimeTrace API</a> | Made with ❤️ for AstrBot</i>
 </p>
+

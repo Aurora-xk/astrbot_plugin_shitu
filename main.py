@@ -2,12 +2,15 @@ from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.star import Context, Star, register
 from astrbot.api import logger
 from astrbot.api.message_components import Image as MsgImage, Reply
+import astrbot.api.message_components as Comp
 import aiohttp
 import asyncio
 import base64
 import re
 from io import BytesIO
 from PIL import Image as PILImage
+import os
+import tempfile
 
 
 @register("astrbot_plugin_shitu", "aurora", "动漫/Gal/二游图片识别插件", "3.5", "https://github.com/Aurora-xk/astrbot_plugin_shitu")
@@ -27,7 +30,8 @@ class AnimeTracePlugin(Star):
         self.timeout_seconds = shitu_config.get("timeout_seconds", 30)
         self.prompt_send_image = shitu_config.get("prompt_send_image", "📷 请发送要识别的图片（30秒内有效）")
         self.prompt_timeout = shitu_config.get("prompt_timeout", "⏰ 识别请求已超时，请重新发送命令")
-        self.use_markdown = shitu_config.get("use_markdown", True)
+        self.return_crops = shitu_config.get("return_crops", True)
+        self.max_crops = shitu_config.get("max_crops", 5)
 
     async def initialize(self):
         logger.info("动漫/Gal/二游识别插件已加载")
@@ -103,18 +107,12 @@ class AnimeTracePlugin(Star):
     async def handle_avatar_recognition(self, event: AstrMessageEvent, model: str):
         """处理QQ头像识别"""
         try:
-            # 调试日志
-            logger.debug(f"头像识别命令被触发 - 模型: {model}")
-            logger.debug(f"消息详情: {event.get_messages()}")
-
             # 提取被@的用户或手动输入的QQ号
             mentioned_user_id = await self.extract_mentioned_user(event)
-            logger.debug(f"提取到的用户ID: {mentioned_user_id}")
 
             if not mentioned_user_id:
                 # 如果没有@任何人，默认使用发送者自己的头像
                 mentioned_user_id = event.get_sender_id()
-                logger.debug(f"未找到被@用户，使用发送者自己的ID: {mentioned_user_id}")
                 await event.send(event.plain_result("📸 识别您自己的头像..."))
             else:
                 # 检查是否是手动输入的QQ号（通过正则匹配确认）
@@ -129,13 +127,10 @@ class AnimeTracePlugin(Star):
                 import re
                 qq_match = re.search(r"头像(?:动漫|gal)?识别\s*(\d{5,12})", full_text)
                 if qq_match and qq_match.group(1) == mentioned_user_id:
-                    logger.debug(f"识别到手动输入的QQ号: {mentioned_user_id}")
                     await event.send(event.plain_result(f"📸 识别QQ号 {mentioned_user_id} 的头像..."))
 
             # 获取头像URL
             avatar_url = f"https://q.qlogo.cn/headimg_dl?dst_uin={mentioned_user_id}&spec=640"
-            logger.debug(f"获取用户头像: {mentioned_user_id}")
-
             # 标记此事件已被处理，避免消息监听器重复处理
             event._avatar_command_processed = True
 
@@ -154,18 +149,11 @@ class AnimeTracePlugin(Star):
         # 检查特殊格式的头像识别命令（消息中包含@但命令可能被遗漏的情况）
         messages = event.get_messages()
         full_text = ""
-
-        logger.debug(f"on_message收到消息，消息列表: {messages}")
-
         for msg in messages:
-            logger.debug(f"处理消息组件: type={getattr(msg, 'type', '无type')}, text={getattr(msg, 'text', '无text')}")
-
             if hasattr(msg, "text"):
                 full_text += str(msg.text)
             elif hasattr(msg, "type") and msg.type == "Plain":
                 full_text += str(msg)
-
-        logger.debug(f"提取的完整文本: '{full_text}'")
 
         # 只有当标准命令处理器未处理时才检查
         if not hasattr(event, "_avatar_command_processed"):
@@ -177,7 +165,6 @@ class AnimeTracePlugin(Star):
 
             for pattern, model in avatar_patterns:
                 if re.search(pattern, full_text):
-                    logger.debug(f"通过on_message检测到头像识别命令: {pattern}")
                     # 标记为已处理，避免重复
                     event._avatar_command_processed = True
                     await self.handle_avatar_recognition(event, model)
@@ -209,7 +196,7 @@ class AnimeTracePlugin(Star):
     async def process_image_recognition(
         self, event: AstrMessageEvent, image_url: str, model: str
     ):
-        """处理图片识别"""
+        """处理图片识别，并在识别后返回裁剪图片"""
         try:
             # 首先尝试直接使用URL调用API（更高效）
             results = await self.call_animetrace_api_with_url(image_url, model)
@@ -220,13 +207,8 @@ class AnimeTracePlugin(Star):
                 img_data = await self.download_and_process_image(image_url)
                 results = await self.call_animetrace_api(img_data, model)
 
-            # 格式化并发送结果
-            response = self.format_results(results, model)
-            try:
-                await event.send(event.plain_result(response))
-            except Exception as send_error:
-                logger.warning(f"发送识别结果失败: {send_error}")
-                # 如果发送失败，记录日志但不抛出异常
+            # 将所有内容（图片+文字）合并到一条消息中发送
+            await self.send_combined_result(event, image_url, results, model)
 
         except Exception as e:
             error_msg = str(e)
@@ -251,7 +233,6 @@ class AnimeTracePlugin(Star):
     async def extract_mentioned_user(self, event: AstrMessageEvent) -> str:
         """从事件中提取被@的用户QQ号或手动输入的QQ号"""
         messages = event.get_messages()
-        logger.debug(f"开始提取被@用户或手动QQ号，消息列表: {messages}")
 
         # 首先检查是否有手动输入的QQ号
         full_text = ""
@@ -261,43 +242,33 @@ class AnimeTracePlugin(Star):
             elif hasattr(msg, "type") and msg.type == "Plain":
                 full_text += str(msg)
 
-        logger.debug(f"提取的完整文本: '{full_text}'")
-
         # 匹配手动输入QQ号的格式：头像识别 12345678910 或 头像识别12345678910
         import re
         qq_match = re.search(r"头像(?:动漫|gal)?识别\s*(\d{5,12})", full_text)
         if qq_match:
             qq_number = qq_match.group(1)
-            logger.debug(f"找到手动输入的QQ号: {qq_number}")
             return qq_number
 
         for msg in messages:
-            logger.debug(f"检查消息组件: type={getattr(msg, 'type', '无type')}, qq={getattr(msg, 'qq', '无qq')}, user_id={getattr(msg, 'user_id', '无user_id')}")
-
             # 检查是否有@提及
             if hasattr(msg, "type") and msg.type == "At":
                 # QQ平台的@消息
                 if hasattr(msg, "qq"):
-                    logger.debug(f"找到At组件，qq: {msg.qq}")
                     return str(msg.qq)
                 if hasattr(msg, "user_id"):
-                    logger.debug(f"找到At组件，user_id: {msg.user_id}")
                     return str(msg.user_id)
 
             # 检查文本中的@格式
             if hasattr(msg, "text"):
                 text = str(msg.text)
-                logger.debug(f"检查文本消息: {text}")
                 # 匹配 [CQ:at,qq=123456] 格式
                 at_match = re.search(r"\[CQ:at,qq=(\d+)\]", text)
                 if at_match:
-                    logger.debug(f"找到CQ码@格式: {at_match.group(1)}")
                     return at_match.group(1)
 
                 # 匹配 @用户名 格式（需要平台支持）
                 # 有些平台会直接解析为At组件，这里作为备选
 
-        logger.debug("未找到被@的用户或手动输入的QQ号")
         return None
 
     async def extract_image_from_event(self, event: AstrMessageEvent) -> str:
@@ -339,7 +310,6 @@ class AnimeTracePlugin(Star):
                         for reply_msg in msg.chain:
                             if isinstance(reply_msg, MsgImage):
                                 if hasattr(reply_msg, "url") and reply_msg.url:
-                                    logger.debug(f"在引用消息中找到图片URL: {reply_msg.url}")
                                     return reply_msg.url.strip()
                                 if hasattr(reply_msg, "file") and reply_msg.file:
                                     file_content = str(reply_msg.file)
@@ -347,14 +317,11 @@ class AnimeTracePlugin(Star):
                                         import re
                                         urls = re.findall(r"https?://[^\s\`\']+", file_content)
                                         if urls:
-                                            logger.debug(f"在引用消息文件中找到图片URL: {urls[0]}")
                                             return urls[0].strip("`'")
 
         except Exception as e:
             logger.warning(f"检查引用消息图片时出错: {str(e)}")
 
-        # 如果没有找到图片，记录日志
-        logger.debug("在当前消息和引用消息中均未找到图片")
         return None
 
     async def download_and_process_image(self, image_url: str) -> str:
@@ -461,10 +428,10 @@ class AnimeTracePlugin(Star):
         if not data.get("data") or not data["data"]:
             return "🔍 未找到匹配的信息"
 
-        first_result = data["data"][0]
-        characters = first_result.get("character", [])
-
-        if not characters:
+        results = data["data"]
+        # 过滤掉没有角色信息的框
+        results = [item for item in results if item.get("character")]
+        if not results:
             return "🔍 未识别到具体角色信息"
 
         model_name_map = {
@@ -480,36 +447,133 @@ class AnimeTracePlugin(Star):
         model_name = model_name_map.get(model, "图片识别")
         emoji = emoji_map.get(model, "🔍")
 
-        if self.use_markdown:
-            # Markdown格式输出
-            lines = [f"**{emoji} {model_name}结果**", "=" * 20]
-            
-            # 显示前5个结果
-            for i, char in enumerate(characters[:5]):
-                name = char.get("character", "未知角色")
-                work = char.get("work", "未知作品")
-                lines.append(f"{i + 1}. **{name}** - 《{work}》")
-            
-            if len(characters) > 5:
-                lines.append(f"\n> 共 {len(characters)} 个结果，显示前5项")
-            
-            lines.append("\n💡 数据来源: AnimeTrace，仅供参考")
-        else:
-            # 纯文本格式输出
-            lines = [f"{emoji} {model_name}结果"]
-            
-            # 显示前5个结果
+        # 纯文本格式输出
+        lines = [f"{emoji} {model_name}结果"]
+
+        for idx, item in enumerate(results, start=1):
+            characters = item.get("character", [])
+            if not characters:
+                continue
+
+            if len(results) > 1:
+                lines.append(f"\n第 {idx} 个角色：")
+
             for i, char in enumerate(characters[:5]):
                 name = char.get("character", "未知角色")
                 work = char.get("work", "未知作品")
                 lines.append(f"{i + 1}. {name} - 《{work}》")
-            
+
             if len(characters) > 5:
                 lines.append(f"共 {len(characters)} 个结果，显示前5项")
-            
-            lines.append("数据来源: AnimeTrace，仅供参考")
+
+        lines.append("数据来源: AnimeTrace，仅供参考")
 
         return "\n".join(lines)
+
+    async def send_combined_result(self, event: AstrMessageEvent, image_url: str, results: dict, model: str):
+        """将所有图片和文字合并到一条消息中发送"""
+        try:
+            data_list = results.get("data") or []
+            if not data_list:
+                # 没有识别结果，只发送文字
+                response = self.format_results(results, model)
+                await event.send(event.plain_result(response))
+                return
+
+            # 构建消息链
+            chain = []
+            
+            # 如果需要发送裁剪图片，先处理图片
+            if self.return_crops:
+                # 下载原图
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(image_url, timeout=30) as response:
+                        if response.status != 200:
+                            logger.debug(f"裁剪图片下载失败: HTTP {response.status}")
+                            # 下载失败，只发送文字结果
+                            response_text = self.format_results(results, model)
+                            await event.send(event.plain_result(response_text))
+                            return
+                        img_data = await response.read()
+
+                img = PILImage.open(BytesIO(img_data)).convert("RGB")
+                w, h = img.size
+
+                # 临时目录，存放裁剪后的图片
+                tmp_dir = tempfile.mkdtemp(prefix="astrbot_shitu_crops_")
+                crop_paths = []
+
+                # 裁剪所有角色的图片
+                for idx, item in enumerate(data_list, start=1):
+                    if len(crop_paths) >= self.max_crops:
+                        break
+
+                    box = item.get("box")
+                    if not box or len(box) != 4:
+                        continue
+
+                    # 参考 anime/animetrace_search.py 的裁剪逻辑
+                    x1 = int(max(0, min(1, float(box[0]))) * w)
+                    y1 = int(max(0, min(1, float(box[1]))) * h)
+                    x2 = int(max(0, min(1, float(box[2]))) * w)
+                    y2 = int(max(0, min(1, float(box[3]))) * h)
+
+                    if x2 <= x1 or y2 <= y1:
+                        continue
+
+                    cropped = img.crop((x1, y1, x2, y2))
+                    out_path = os.path.join(tmp_dir, f"crop_{idx}.jpg")
+                    cropped.save(out_path, format="JPEG", quality=90)
+                    crop_paths.append((idx, out_path, item))
+
+                # 将图片和对应的文字添加到消息链中
+                for idx, out_path, item in crop_paths:
+                    # 添加图片
+                    chain.append(Comp.Image.fromFileSystem(out_path))
+                    
+                    # 添加该角色的文字信息
+                    characters = item.get("character") or []
+                    if characters:
+                        text_lines = []
+                        if len(crop_paths) > 1:
+                            text_lines.append(f"第 {idx} 个角色：")
+                        
+                        for i, char in enumerate(characters[:5]):
+                            name = char.get("character", "未知角色")
+                            work = char.get("work", "未知作品")
+                            text_lines.append(f"{i + 1}. {name} - 《{work}》")
+                        
+                        if len(characters) > 5:
+                            text_lines.append(f"共 {len(characters)} 个结果，显示前5项")
+                        
+                        if text_lines:
+                            chain.append(Comp.Plain("\n".join(text_lines)))
+                            chain.append(Comp.Plain(""))  # 添加空行分隔
+
+            # 添加总览文字（如果有多于一个角色，或者没有发送裁剪图片）
+            if not self.return_crops or len(crop_paths) < len(data_list):
+                response_text = self.format_results(results, model)
+                chain.append(Comp.Plain(response_text))
+            else:
+                # 只添加数据来源说明
+                chain.append(Comp.Plain("💡 数据来源: AnimeTrace，仅供参考"))
+
+            # 发送合并后的消息
+            if chain:
+                await event.send(event.chain_result(chain))
+            else:
+                # 如果消息链为空，发送文字结果
+                response_text = self.format_results(results, model)
+                await event.send(event.plain_result(response_text))
+
+        except Exception as e:
+            logger.warning(f"发送合并结果失败: {e}")
+            # 失败时回退到只发送文字结果
+            try:
+                response_text = self.format_results(results, model)
+                await event.send(event.plain_result(response_text))
+            except Exception as send_error:
+                logger.warning(f"发送文字结果也失败: {send_error}")
 
     async def timeout_check(self, user_id: str):
         """超时检查"""

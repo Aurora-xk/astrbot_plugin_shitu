@@ -13,19 +13,25 @@
         "description": "提示用户发送图片的文字",
         "type": "string",
         "default": "📷 请发送要识别的图片（30秒内有效）",
-        "hint": "可以自定义提示文字，支持emoji和特殊字符"
+        "hint": "可以自定义提示文字"
       },
       "prompt_timeout": {
         "description": "用户超时后的提示文字",
         "type": "string", 
         "default": "⏰ 识别请求已超时，请重新发送命令",
-        "hint": "可以自定义超时提示文字，支持emoji和特殊字符"
+        "hint": "可以自定义超时提示文字"
       },
-      "use_markdown": {
-        "description": "是否使用Markdown格式输出结果",
+      "return_crops": {
+        "description": "是否在文字结果后发送裁剪出的角色图片",
         "type": "bool",
         "default": true,
-        "hint": "开启后会使用Markdown格式美化输出结果，关闭则使用纯文本格式"
+        "hint": "开启后会根据识别结果的box裁剪人物区域并发送图片"
+      },
+      "max_crops": {
+        "description": "每次识别最多发送的图片数量",
+        "type": "int",
+        "default": 5,
+        "hint": "过大可能导致一次发送过多图片"
       }
     }
   }
