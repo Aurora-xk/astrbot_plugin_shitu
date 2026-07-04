@@ -1,6 +1,6 @@
 {
   "shitu_settings": {
-    "description": "识图插件设置",
+    "description": "AnimeTrace图片识别插件设置",
     "type": "object",
     "items": {
       "timeout_seconds": {
@@ -32,6 +32,18 @@
         "type": "int",
         "default": 5,
         "hint": "过大可能导致一次发送过多图片"
+      },
+      "max_characters_per_role": {
+        "description": "每个角色识别结果最多显示的角色数量",
+        "type": "int",
+        "default": 5,
+        "hint": "设置为0或负数表示不限制"
+      },
+      "forward_threshold": {
+        "description": "识别到多少个角色时自动使用合并转发（聊天记录）发送",
+        "type": "int",
+        "default": 0,
+        "hint": "设置为0表示关闭合并转发；仅支持 aiocqhttp 适配器（QQ），其他适配器会自动回退到普通消息"
       }
     }
   }
