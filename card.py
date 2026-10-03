@@ -269,7 +269,7 @@ def render_card(model_name: str, items: list, max_characters: int = 5) -> Image.
     banner_cy = padding + banner_h // 2
     draw.text(
         (padding + 24, banner_cy),
-        "二次元角色识别结果",
+        "识别结果",
         font=f_title,
         fill=(255, 255, 255),
         anchor="lm",
