@@ -2,11 +2,8 @@ import asyncio
 import os
 import re
 import tempfile
-import urllib.parse
-from io import BytesIO
 
 import aiohttp
-from PIL import Image as PILImage
 
 import astrbot.api.message_components as Comp
 from astrbot.api import logger
@@ -15,14 +12,16 @@ from astrbot.api.message_components import Image as MsgImage
 from astrbot.api.message_components import Reply
 from astrbot.api.star import Context, Star, register
 
+from .card import render_card
+from .crops import collect_crops
+
 DEFAULT_CONFIG = {
     "timeout_seconds": 30,
     "prompt_send_image": "📷 请发送要识别的图片（30秒内有效）",
     "prompt_timeout": "⏰ 识别请求已超时，请重新发送命令",
-    "return_crops": True,
-    "max_crops": 5,
     "max_characters_per_role": 5,
-    "forward_threshold": 0,
+    "result_as_image": True,
+    "no_result_reply": "🔍 未识别到图片中的角色，请更换图片后重试",
 }
 
 API_ERROR_CODES = {
@@ -79,62 +78,39 @@ class AnimeTracePlugin(Star):
         logger.info("AnimeTrace图片识别插件已加载")
 
     async def _fetch_models(self):
-        try:
-            async with self._session.get(self.model_list_url) as response:
-                if response.status != 200:
-                    logger.warning(f"获取模型列表失败: HTTP {response.status}")
-                    return
+        async with self._session.get(self.model_list_url) as response:
+            response.raise_for_status()
+            result = await response.json()
 
-                result = await response.json()
-                if result.get("code") != 0:
-                    logger.warning(
-                        f"获取模型列表失败: {result.get('message', '未知错误')}"
-                    )
-                    return
-
-                self._models = result.get("data", [])
-                enabled_models = [m for m in self._models if m.get("enabled", False)]
-                self._default_model = next(
-                    (m for m in enabled_models if m.get("default", False)),
-                    enabled_models[0] if enabled_models else None,
-                )
-                self._model_cache_time = asyncio.get_event_loop().time()
-
-                model_names = [m["name"] for m in self._models]
-                logger.debug(f"已加载模型列表: {model_names}")
-        except Exception as e:
-            logger.warning(f"获取模型列表异常: {str(e)}")
+        self._models = result.get("data", [])
+        enabled_models = [m for m in self._models if m.get("enabled", False)]
+        self._default_model = next(
+            (m for m in enabled_models if m.get("default", False)),
+            enabled_models[0] if enabled_models else None,
+        )
+        self._model_cache_time = asyncio.get_event_loop().time()
+        logger.debug(f"已加载模型列表: {[m['name'] for m in self._models]}")
 
     async def _get_default_model(self) -> dict:
         current_time = asyncio.get_event_loop().time()
-        if (
-            not self._models
-            or current_time - self._model_cache_time > self._model_cache_ttl
-        ):
+        if current_time - self._model_cache_time > self._model_cache_ttl:
             await self._fetch_models()
 
-        if self._current_model:
-            return self._current_model
-
-        return self._default_model or self._models[0]
+        return self._current_model or self._default_model
 
     @filter.command("识别")
-    async def trace_search(self, event: AstrMessageEvent, args=None):
+    async def trace_search(self, event: AstrMessageEvent):
         default_model = await self._get_default_model()
         return await self.handle_image_recognition(event, default_model["id"])
 
     @filter.command("头像识别")
-    async def avatar_trace_search(self, event: AstrMessageEvent, args=None):
+    async def avatar_trace_search(self, event: AstrMessageEvent):
         default_model = await self._get_default_model()
         return await self.handle_avatar_recognition(event, default_model["id"])
 
     @filter.command("amt model")
     async def model_list(self, event: AstrMessageEvent, args=None):
         await self._fetch_models()
-
-        if not self._models:
-            await event.send(event.plain_result("❌ 无法获取模型列表，请稍后重试"))
-            return
 
         if args is not None:
             try:
@@ -282,13 +258,6 @@ class AnimeTracePlugin(Star):
         try:
             if image_url.startswith(("http://", "https://")):
                 results = await self.call_animetrace_api_with_url(image_url, model)
-                if not results or not results.get("data"):
-                    logger.debug("URL识别方式未返回结果，尝试file方式...")
-                    temp_path = await self.download_to_temp_file(image_url)
-                    if temp_path:
-                        results = await self.call_animetrace_api_with_file(
-                            temp_path, model
-                        )
             elif os.path.isfile(image_url):
                 results = await self.call_animetrace_api_with_file(image_url, model)
             else:
@@ -300,7 +269,9 @@ class AnimeTracePlugin(Star):
             error_msg = str(e)
             logger.error(f"识别失败: {error_msg}")
 
-            if "HTTP 500" in error_msg:
+            if isinstance(e, asyncio.TimeoutError):
+                user_msg = "❌ 识别超时，请稍后重试"
+            elif "HTTP 500" in error_msg:
                 user_msg = "❌ 识别服务暂时不可用，请稍后重试"
             elif "HTTP 422" in error_msg:
                 user_msg = "❌ 图片格式不支持，请尝试其他图片"
@@ -443,56 +414,6 @@ class AnimeTracePlugin(Star):
         """获取图片组件的引用（优先url，其次file）"""
         return getattr(msg, "url", None) or getattr(msg, "file", None)
 
-    async def _download_image_data(self, image_url: str) -> bytes:
-        """下载图片数据（支持本地路径、file:// URI和HTTP/HTTPS URL）"""
-        if os.path.isfile(image_url):
-            logger.debug(f"读取本地图片: {image_url}")
-            with open(image_url, "rb") as f:
-                return f.read()
-
-        if image_url.startswith("file://"):
-            file_path = urllib.parse.unquote(image_url.replace("file://", ""))
-            if os.name == "nt" and file_path.startswith("/"):
-                file_path = file_path[1:]
-            logger.debug(f"读取file://图片: {file_path}")
-            with open(file_path, "rb") as f:
-                return f.read()
-
-        if image_url.startswith("telegram://"):
-            raise Exception("Telegram文件暂不支持")
-
-        async with self._session.get(image_url) as response:
-            if response.status != 200:
-                raise Exception(f"图片下载失败: HTTP {response.status}")
-            return await response.read()
-
-    async def download_to_temp_file(self, image_url: str) -> str:
-        logger.debug(f"下载图片到临时文件: {image_url[:100]}...")
-
-        try:
-            img_data = await self._download_image_data(image_url)
-
-            img = PILImage.open(BytesIO(img_data))
-
-            if max(img.size) > 1024:
-                ratio = 1024 / max(img.size)
-                new_size = (int(img.size[0] * ratio), int(img.size[1] * ratio))
-                img = img.resize(new_size, PILImage.LANCZOS)
-
-            with tempfile.NamedTemporaryFile(
-                mode="wb", suffix=".jpg", delete=False
-            ) as f:
-                img.save(f, format="JPEG", quality=85)
-                temp_path = f.name
-
-            logger.debug(f"图片保存到临时文件: {temp_path}")
-            return temp_path
-        except asyncio.TimeoutError:
-            raise Exception("图片下载超时，请稍后重试")
-        except Exception as e:
-            logger.error(f"图片下载失败: {str(e)}")
-            raise Exception(f"图片下载失败: {str(e)}")
-
     def _get_model_name(self, model_id: str) -> str:
         """根据模型ID获取显示名称"""
         model = next((m for m in self._models if m["id"] == model_id), None)
@@ -500,100 +421,69 @@ class AnimeTracePlugin(Star):
             return model.get("name", model_id)
         return model_id
 
+    @staticmethod
+    async def _parse_api_response(response) -> dict:
+        """解析API响应；非JSON响应时抛出带HTTP状态码的异常。"""
+        try:
+            return await response.json()
+        except Exception:
+            raise Exception(f"API错误: HTTP {response.status}")
+
+    @staticmethod
+    def _check_api_code(result: dict):
+        """校验API返回码，非成功码时抛出带错误信息的异常。"""
+        code = result.get("code")
+        if code in (0, 17720, 200, 17721):
+            return
+        error_msg = result.get("zh_message") or API_ERROR_CODES.get(
+            code, f"未知错误 (code={code})"
+        )
+        logger.warning(f"API返回错误码: {code}, 消息: {error_msg}")
+        raise Exception(f"API错误: {error_msg}")
+
     async def call_animetrace_api_with_file(self, file_path: str, model: str) -> dict:
         model_name = self._get_model_name(model)
         logger.debug(f"调用API - 模型: {model_name} (file方式)")
 
-        try:
-            with open(file_path, "rb") as f:
-                file_data = f.read()
+        with open(file_path, "rb") as f:
+            file_data = f.read()
 
-            form = aiohttp.FormData()
-            form.add_field("is_multi", "1")
-            form.add_field("model", model)
-            form.add_field("ai_detect", "0")
-            form.add_field("file", file_data, filename="image.jpg", content_type="image/jpeg")
+        form = aiohttp.FormData()
+        form.add_field("is_multi", "1")
+        form.add_field("model", model)
+        form.add_field("ai_detect", "0")
+        form.add_field("file", file_data, filename="image.jpg", content_type="image/jpeg")
 
-            async with self._session.post(self.api_url, data=form) as response:
-                try:
-                    result = await response.json()
-                except Exception:
-                    error_text = await response.text()
-                    logger.warning(
-                        f"API返回错误状态: HTTP {response.status}, 响应: {error_text[:200]}"
-                    )
-                    raise Exception(f"API错误: HTTP {response.status}")
+        async with self._session.post(self.api_url, data=form) as response:
+            result = await self._parse_api_response(response)
 
-                code = result.get("code")
-
-                if code not in (0, 17720, 200, 17721):
-                    zh_message = result.get("zh_message", "")
-                    if zh_message:
-                        error_msg = zh_message
-                    else:
-                        error_msg = API_ERROR_CODES.get(code, f"未知错误 (code={code})")
-                    logger.warning(f"API返回错误码: {code}, 消息: {error_msg}")
-                    raise Exception(f"API错误: {error_msg}")
-
-                logger.debug(f"API返回: {len(result.get('data', []))} 个结果")
-                return result
-        except asyncio.TimeoutError:
-            logger.error("API调用超时")
-            raise Exception("识别服务响应超时，请稍后重试")
-        except Exception as e:
-            logger.error(f"file API调用失败: {str(e)}")
-            raise
+        self._check_api_code(result)
+        logger.debug(f"API返回: {len(result.get('data', []))} 个结果")
+        return result
 
     async def call_animetrace_api_with_url(self, image_url: str, model: str) -> dict:
         payload = {"url": image_url, "is_multi": 1, "model": model, "ai_detect": 0}
         model_name = self._get_model_name(model)
         logger.debug(f"调用API - 模型: {model_name} (URL方式)")
 
-        try:
-            async with self._session.post(self.api_url, data=payload) as response:
-                try:
-                    result = await response.json()
-                except Exception:
-                    if response.status in [422, 500, 502, 503, 504]:
-                        logger.debug(
-                            f"URL识别失败 (HTTP {response.status})，准备回退到file方式"
-                        )
-                        return {"data": []}
-                    error_text = await response.text()
-                    logger.warning(
-                        f"API返回错误状态: HTTP {response.status}, 响应: {error_text[:200]}"
-                    )
-                    raise Exception(f"API错误: HTTP {response.status}")
+        async with self._session.post(self.api_url, data=payload) as response:
+            result = await self._parse_api_response(response)
 
-                code = result.get("code")
+        self._check_api_code(result)
+        logger.debug(f"API返回: {len(result.get('data', []))} 个结果")
+        return result
 
-                if code not in (0, 17720, 200, 17721):
-                    if code in (17701, 17705, 17708, 17722):
-                        logger.debug(
-                            f"URL识别失败 (code={code})，准备回退到file方式"
-                        )
-                        return {"data": []}
-                    zh_message = result.get("zh_message", "")
-                    if zh_message:
-                        error_msg = zh_message
-                    else:
-                        error_msg = API_ERROR_CODES.get(code, f"未知错误 (code={code})")
-                    logger.warning(f"API返回错误码: {code}, 消息: {error_msg}")
-                    raise Exception(f"API错误: {error_msg}")
-
-                logger.debug(f"API返回: {len(result.get('data', []))} 个结果")
-                return result
-        except Exception as e:
-            logger.warning(f"URL方式调用失败: {str(e)}，准备回退到file方式")
-            return {"data": []}
+    @staticmethod
+    def _format_match_line(i: int, char: dict) -> str:
+        """格式化单条匹配结果；未知作品不显示。"""
+        name = char.get("character", "未知角色")
+        work = char.get("work") or ""
+        if work and work != "未知作品":
+            return f"{i + 1}. {name} - 《{work}》"
+        return f"{i + 1}. {name}"
 
     def format_results(self, data: dict, model: str) -> str:
-        if not data.get("data") or not data["data"]:
-            return "🔍 未找到匹配的信息"
-
         results = [item for item in data["data"] if item.get("character")]
-        if not results:
-            return "🔍 未识别到具体角色信息"
 
         model_name = self._get_model_name(model)
 
@@ -610,174 +500,95 @@ class AnimeTracePlugin(Star):
             limit = self.max_characters_per_role
             display_characters = characters[:limit] if limit > 0 else characters
             for i, char in enumerate(display_characters):
-                name = char.get("character", "未知角色")
-                work = char.get("work", "未知作品")
-                lines.append(f"{i + 1}. {name} - 《{work}》")
+                lines.append(self._format_match_line(i, char))
 
             if limit > 0 and len(characters) > limit:
                 lines.append(f"共 {len(characters)} 个结果，显示前{limit}项")
 
-        model_name = self._get_model_name(model)
         lines.append("数据来源: AnimeTrace，仅供参考")
         lines.append(f"当前模型: {model_name}")
 
         return "\n".join(lines)
 
+    async def _render_result_card(self, model: str, crop_items: list) -> str:
+        """将识别结果渲染为图片卡片，返回图片文件路径。"""
+        model_name = self._get_model_name(model)
+        card_img = render_card(
+            model_name,
+            crop_items,
+            max_characters=self.max_characters_per_role,
+        )
+        tmp_dir = tempfile.mkdtemp(prefix="astrbot_shitu_card_")
+        out_path = os.path.join(tmp_dir, "result_card.png")
+        card_img.save(out_path, format="PNG")
+        logger.debug(f"识别结果已渲染为卡片: {out_path}")
+        return out_path
+
     async def send_combined_result(
         self, event: AstrMessageEvent, image_url: str, results: dict, model: str
     ):
-        try:
-            data_list = results.get("data") or []
-            if not data_list:
-                response = self.format_results(results, model)
-                await event.send(event.plain_result(response))
-                return
+        data_list = results.get("data") or []
+        if not any(item.get("character") for item in data_list):
+            await event.send(event.plain_result(self.no_result_reply))
+            return
 
-            chain = []
+        crop_items = await collect_crops(self._session, image_url, data_list)
 
-            if self.return_crops:
-                try:
-                    img_data = await self._download_image_data(image_url)
-                except Exception as e:
-                    logger.debug(f"裁剪图片下载失败: {str(e)}")
-                    response_text = self.format_results(results, model)
-                    await event.send(event.plain_result(response_text))
-                    return
-
-                img = PILImage.open(BytesIO(img_data)).convert("RGB")
-                w, h = img.size
-
-                tmp_dir = tempfile.mkdtemp(prefix="astrbot_shitu_crops_")
-                crop_paths = []
-
-                for idx, item in enumerate(data_list, start=1):
-                    if len(crop_paths) >= self.max_crops:
-                        break
-
-                    box = item.get("box")
-                    if not box or len(box) != 4:
-                        continue
-
-                    x1 = int(max(0, min(1, float(box[0]))) * w)
-                    y1 = int(max(0, min(1, float(box[1]))) * h)
-                    x2 = int(max(0, min(1, float(box[2]))) * w)
-                    y2 = int(max(0, min(1, float(box[3]))) * h)
-
-                    if x2 <= x1 or y2 <= y1:
-                        continue
-
-                    cropped = img.crop((x1, y1, x2, y2))
-                    out_path = os.path.join(tmp_dir, f"crop_{idx}.jpg")
-                    cropped.save(out_path, format="JPEG", quality=90)
-                    crop_paths.append((idx, out_path, item))
-
-                for idx, out_path, item in crop_paths:
-                    chain.append(Comp.Image.fromFileSystem(out_path))
-
-                    characters = item.get("character") or []
-                    if characters:
-                        text_lines = []
-                        if len(crop_paths) > 1:
-                            text_lines.append(f"第 {idx} 个角色：")
-
-                        limit = self.max_characters_per_role
-                        display_characters = (
-                            characters[:limit] if limit > 0 else characters
-                        )
-                        for i, char in enumerate(display_characters):
-                            name = char.get("character", "未知角色")
-                            work = char.get("work", "未知作品")
-                            text_lines.append(f"{i + 1}. {name} - 《{work}》")
-
-                        if limit > 0 and len(characters) > limit:
-                            text_lines.append(
-                                f"共 {len(characters)} 个结果，显示前{limit}项"
-                            )
-
-                        if text_lines:
-                            chain.append(Comp.Plain("\n".join(text_lines)))
-                            chain.append(Comp.Plain(""))
-
-            if not self.return_crops or len(crop_paths) < len(data_list):
-                response_text = self.format_results(results, model)
-                chain.append(Comp.Plain(response_text))
-            else:
-                model_name = self._get_model_name(model)
-                chain.append(Comp.Plain(f"💡 数据来源: AnimeTrace，仅供参考\n当前模型: {model_name}"))
-
-            character_count = len(
-                [item for item in data_list if item.get("character")]
-            )
-            use_forward = (
-                self.forward_threshold > 0
-                and character_count >= self.forward_threshold
-                and event.get_platform_name() == "aiocqhttp"
-            )
-
-            if chain:
-                if use_forward:
-                    sender_name = event.get_sender_name() or "AnimeTrace"
-                    sender_id = event.get_sender_id() or "10000"
-                    nodes = []
-                    current_content = []
-                    for comp in chain:
-                        if isinstance(comp, Comp.Image):
-                            if current_content:
-                                nodes.append(
-                                    Comp.Node(
-                                        content=current_content,
-                                        name=sender_name,
-                                        uin=sender_id,
-                                    )
-                                )
-                                current_content = []
-                            current_content.append(comp)
-                        elif isinstance(comp, Comp.Plain):
-                            if comp.text.strip():
-                                current_content.append(comp)
-                        else:
-                            current_content.append(comp)
-                    if current_content:
-                        nodes.append(
-                            Comp.Node(
-                                content=current_content,
-                                name=sender_name,
-                                uin=sender_id,
-                            )
-                        )
-                    if nodes:
-                        await event.send(event.chain_result([Comp.Nodes(nodes)]))
-                else:
-                    await event.send(event.chain_result(chain))
-            else:
-                response_text = self.format_results(results, model)
-                await event.send(event.plain_result(response_text))
-
-        except Exception as e:
-            logger.warning(f"发送合并结果失败: {e}")
+        # 将识别结果渲染为图片卡片发送
+        if self.result_as_image and crop_items:
             try:
-                response_text = self.format_results(results, model)
-                await event.send(event.plain_result(response_text))
-            except Exception as send_error:
-                logger.warning(f"发送文字结果也失败: {send_error}")
+                card_path = await self._render_result_card(model, crop_items)
+                await event.send(
+                    event.chain_result([Comp.Image.fromFileSystem(card_path)])
+                )
+                return
+            except Exception as e:
+                logger.warning(f"结果卡片渲染失败，回退到文字模式: {str(e)}")
+
+        # 卡片关闭或渲染失败：发送裁剪图 + 文字
+        if not crop_items:
+            await event.send(event.plain_result(self.format_results(results, model)))
+            return
+
+        chain = []
+        for item in crop_items:
+            chain.append(Comp.Image.fromFileSystem(item["crop_path"]))
+
+            characters = item["characters"]
+            if characters:
+                text_lines = []
+                if len(crop_items) > 1:
+                    text_lines.append(f"第 {item['index']} 个角色：")
+
+                limit = self.max_characters_per_role
+                display_characters = characters[:limit] if limit > 0 else characters
+                for i, char in enumerate(display_characters):
+                    text_lines.append(self._format_match_line(i, char))
+
+                if limit > 0 and len(characters) > limit:
+                    text_lines.append(f"共 {len(characters)} 个结果，显示前{limit}项")
+
+                if text_lines:
+                    chain.append(Comp.Plain("\n".join(text_lines)))
+                    chain.append(Comp.Plain(""))
+
+        if len(crop_items) < len(data_list):
+            chain.append(Comp.Plain(self.format_results(results, model)))
+        else:
+            model_name = self._get_model_name(model)
+            chain.append(Comp.Plain(f"💡 数据来源: AnimeTrace，仅供参考\n当前模型: {model_name}"))
+
+        await event.send(event.chain_result(chain))
 
     async def timeout_check(self, user_id: str):
-        try:
-            await asyncio.sleep(self.timeout_seconds)
-            if user_id in self.waiting_sessions:
-                session = self.waiting_sessions[user_id]
-                event = session["event"]
-                del self.waiting_sessions[user_id]
-                del self.timeout_tasks[user_id]
-                try:
-                    await event.send(event.plain_result(self.prompt_timeout))
-                    logger.debug(f"用户 {user_id} 的图片识别请求已超时")
-                except Exception as send_error:
-                    logger.warning(f"发送超时消息失败: {send_error}")
-        except asyncio.CancelledError:
-            pass
-        except Exception as e:
-            logger.error(f"超时检查任务异常: {str(e)}")
+        await asyncio.sleep(self.timeout_seconds)
+        if user_id in self.waiting_sessions:
+            session = self.waiting_sessions[user_id]
+            event = session["event"]
+            del self.waiting_sessions[user_id]
+            del self.timeout_tasks[user_id]
+            await event.send(event.plain_result(self.prompt_timeout))
+            logger.debug(f"用户 {user_id} 的图片识别请求已超时")
 
     async def terminate(self):
         logger.info("AnimeTrace图片识别插件已卸载")

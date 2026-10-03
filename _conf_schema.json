@@ -17,21 +17,9 @@
       },
       "prompt_timeout": {
         "description": "用户超时后的提示文字",
-        "type": "string", 
+        "type": "string",
         "default": "⏰ 识别请求已超时，请重新发送命令",
         "hint": "可以自定义超时提示文字"
-      },
-      "return_crops": {
-        "description": "是否在文字结果后发送裁剪出的角色图片",
-        "type": "bool",
-        "default": true,
-        "hint": "开启后会根据识别结果的box裁剪人物区域并发送图片"
-      },
-      "max_crops": {
-        "description": "每次识别最多发送的图片数量",
-        "type": "int",
-        "default": 5,
-        "hint": "过大可能导致一次发送过多图片"
       },
       "max_characters_per_role": {
         "description": "每个角色识别结果最多显示的角色数量",
@@ -39,11 +27,17 @@
         "default": 5,
         "hint": "设置为0或负数表示不限制"
       },
-      "forward_threshold": {
-        "description": "识别到多少个角色时自动使用合并转发（聊天记录）发送",
-        "type": "int",
-        "default": 0,
-        "hint": "设置为0表示关闭合并转发；仅支持 aiocqhttp 适配器（QQ），其他适配器会自动回退到普通消息"
+      "result_as_image": {
+        "description": "将识别结果渲染为图片卡片发送",
+        "type": "bool",
+        "default": true,
+        "hint": "开启后识别结果会绘制成包含角色裁剪图和匹配列表的图片卡片；渲染失败时自动回退到文字模式"
+      },
+      "no_result_reply": {
+        "description": "图片中未识别到角色时的回复",
+        "type": "string",
+        "default": "🔍 未识别到图片中的角色，请更换图片后重试",
+        "hint": "可以自定义未识别到角色时的提示文字"
       }
     }
   }

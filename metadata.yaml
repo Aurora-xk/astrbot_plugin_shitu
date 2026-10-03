@@ -1,6 +1,6 @@
 name: astrbot_plugin_shitu
-desc: 一个简单的识别gal，动漫的astrbot插件
-version: v4.0
+desc: 识别gal、动漫角色的astrbot插件，支持结果渲染为图片卡片
+version: v4.1
 author: deepseekR1&kimi&Aurora-xk
 repo : https://github.com/Aurora-xk/astrbot_plugin_shitu
 support_platforms:
