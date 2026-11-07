@@ -194,3 +194,5 @@ python -m unittest discover -s tests -v
 <p align="center">
   <i>Powered by <a href="https://ai.animedb.cn/">AnimeTrace API</a> | Made with ❤️ for AstrBot</i>
 </p>
+
+两项工具还可传 `reference_message_id`，只读提取当前会话中该历史消息的图片。消息 ID、群号或私聊对象不匹配时返回错误，不会改用当前、引用或缓存中的其他图片。图片上传和缓存边界不变。

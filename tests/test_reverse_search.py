@@ -128,7 +128,7 @@ class ToolTests(unittest.IsolatedAsyncioTestCase):
         self.plugin._session = object()
 
     async def test_tool_only_accepts_message_image_index_not_path_or_url(self):
-        self.assertEqual(list(inspect.signature(self.plugin.reverse_image_search).parameters), ["event", "image_index", "max_results"])
+        self.assertEqual(list(inspect.signature(self.plugin.reverse_image_search).parameters), ["event", "image_index", "max_results", "reference_message_id"])
         self.assertEqual(json.loads(await self.plugin.reverse_image_search(Event()))["status"], "no_image")
 
     async def test_real_component_uploaded_once_and_cache_avoids_repeated_upload(self):
@@ -190,7 +190,7 @@ class UpstreamPresentationTests(unittest.IsolatedAsyncioTestCase):
         self.event.send = AsyncMock()
 
     async def test_v41_card_path_remains_the_default(self):
-        results = {"data": [{"character": [{"character": "Synthetic Hero"}]}]}
+        results = {"data": [{"not_confident": False, "character": [{"character": "Synthetic Hero"}]}]}
         crops = [{"index": 1, "characters": results["data"][0]["character"],
                   "crop_path": "/unused-synthetic-crop.png"}]
         with patch("astrbot_plugin_shitu.main.collect_crops", AsyncMock(return_value=crops)), \

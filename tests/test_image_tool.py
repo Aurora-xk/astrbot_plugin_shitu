@@ -340,6 +340,65 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(all(channel > 250 for channel in image.getpixel((0, 0))))
 
 
+    async def test_history_id_selects_other_members_image_over_text_reply_and_recent(self):
+        self.bridge.remember(Event([self.image]))
+        bot = Bot({"data": {"message_id": 51, "group_id": "g1", "sender": {"user_id": "member-b"},
+                          "message": [{"type": "image", "data": {"url": "https://example.com/history.png"}}]}})
+        event = Event([Reply(id="52", chain=[Plain("I will look in history")])], bot=bot)
+        images, origin = await self.bridge.select(event, reference_message_id="51")
+        self.assertEqual(origin, "history_message")
+        self.assertEqual(images[0].url, "https://example.com/history.png")
+        self.assertEqual(bot.calls, [{"action": "get_msg", "message_id": 51}])
+
+    async def test_history_id_invalid_or_out_of_scope_never_falls_back(self):
+        self.bridge.remember(Event([self.image]))
+        for bad_id in [None, True, 1.0, "one", "https://example.com/p.png", "/tmp/p.png", "1" * 21]:
+            bot = Bot({})
+            with self.subTest(bad_id=bad_id):
+                with self.assertRaisesRegex(ValueError, "invalid_reference_message_id"):
+                    await self.bridge.select(Event([self.image], bot=bot), reference_message_id=bad_id)
+                self.assertEqual(bot.calls, [])
+        for patch in [{"group_id": "other-group"}, {"group_id": None}, {"message_id": 6}]:
+            data = {"message_id": 5, "group_id": "g1", "message": [
+                {"type": "image", "data": {"url": "https://example.com/p.png"}}]}
+            data.update(patch)
+            with self.subTest(patch=patch):
+                with self.assertRaisesRegex(ValueError, "reference_message_unavailable"):
+                    await self.bridge.select(Event([self.image], bot=Bot(data)), reference_message_id="5")
+
+    async def test_history_id_without_image_never_uses_other_image_or_uploads(self):
+        bot = Bot({"message_id": 5, "group_id": "g1", "message": [
+            {"type": "text", "data": {"text": "no image in this message"}}]})
+        result = await self.call(Event([self.image], bot=bot), reference_message_id="5")
+        self.assertEqual(result["error_code"], "reference_message_no_image")
+        self.assertEqual(self.requests, [])
+        self.assertIn("历史查询", result["guidance"])
+
+    async def test_history_id_in_private_chat_requires_matching_peer(self):
+        data = {"message_id": -5, "message_type": "private", "sender": {"user_id": "member-b"},
+                "message": [{"type": "image", "data": {"url": "https://example.com/p.png"}}]}
+        event = Event(bot=Bot(data), group="", origin="qq:private:member-a")
+        with self.assertRaisesRegex(ValueError, "reference_message_unavailable"):
+            await self.bridge.select(event, reference_message_id="-5")
+        data["sender"]["user_id"] = "member-a"
+        self.assertEqual(len((await self.bridge.select(event, "-5"))[0]), 1)
+        data["sender"]["user_id"] = "self"
+        data["target_id"] = "member-b"
+        with self.assertRaisesRegex(ValueError, "reference_message_unavailable"):
+            await self.bridge.select(event, reference_message_id="-5")
+        data["target_id"] = "member-a"
+        self.assertEqual(len((await self.bridge.select(event, "-5"))[0]), 1)
+
+    async def test_history_fetch_failure_is_fixed_and_does_not_upload(self):
+        class FailingBot:
+            async def call_action(self, **kwargs):
+                raise RuntimeError("private signed URL / token must not appear")
+        result = await self.call(Event([self.image], bot=FailingBot()), reference_message_id="5")
+        self.assertEqual(result["error_code"], "reference_message_unavailable")
+        self.assertEqual(self.requests, [])
+        self.assertNotIn("token", json.dumps(result))
+
+
 class ResultTests(unittest.TestCase):
 
     def test_missing_confidence_and_empty_results_stay_uncertain(self):
@@ -364,7 +423,7 @@ class PluginContractTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_tool_only_exposes_index_no_url_or_path(self):
         signature = inspect.signature(self.plugin.identify_anime_character)
-        self.assertEqual(list(signature.parameters), ["event", "image_index"])
+        self.assertEqual(list(signature.parameters), ["event", "image_index", "reference_message_id"])
         self.assertEqual(signature.parameters["image_index"].default, 1)
 
     async def test_llm_hook_idempotent_and_no_network(self):
@@ -398,6 +457,14 @@ class PluginContractTests(unittest.IsolatedAsyncioTestCase):
     async def test_empty_models_do_not_index_error_or_retry_immediately(self):
         self.plugin._model_cache_time = asyncio.get_running_loop().time()
         self.assertIsNone(await self.plugin._get_default_model())
+
+
+
+    async def test_tool_exposes_index_and_history_id_without_url_or_path(self):
+        signature = inspect.signature(self.plugin.identify_anime_character)
+        self.assertEqual(list(signature.parameters), ["event", "image_index", "reference_message_id"])
+        self.assertEqual(signature.parameters["image_index"].default, 1)
+        self.assertEqual(signature.parameters["reference_message_id"].default, "")
 
 
 if __name__ == "__main__":

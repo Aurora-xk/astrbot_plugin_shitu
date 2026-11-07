@@ -18,7 +18,7 @@ from astrbot.api.star import Context, Star, register
 
 from .card import render_card
 from .crops import collect_crops
-from .image_tool import ImageRecognitionBridge, result_json
+from .image_tool import ImageRecognitionBridge, NO_IMAGE_GUIDANCE, result_json, selection_error
 from .reverse_search import reverse_search as upload_reverse_search
 
 DEFAULT_CONFIG = {
@@ -110,11 +110,13 @@ class AnimeTracePlugin(Star):
         return self._current_model or self._default_model
 
     @filter.llm_tool(name="identify_anime_character")
-    async def identify_anime_character(self, event: AstrMessageEvent, image_index: int = 1) -> str:
+    async def identify_anime_character(self, event: AstrMessageEvent, image_index: int = 1,
+                                       reference_message_id: str = "") -> str:
         """通过 AnimeTrace 实际检索用户图片中的动漫、GalGame 或二次元游戏角色候选。
 
         用户询问图片中人物是谁、角色姓名或出处时使用；不是通用看图描述工具。
         只读取本条消息图片、明确引用的图片，或同一发送者在同一会话最近 5 分钟发的图片。
+        需要识别本会话历史图片时，先查询历史取得真实消息ID，再传 reference_message_id；不能跨会话取图。
         不接受 URL/路径。可能未收录新角色、真人、截图或画风变化，候选不等于确认。
         返回 not_confident=true/缺失、无命中或错误时，此接口无法确认；可继续调用
         reverse_image_search 上传原图查插画索引的角色/作品标注，不要就此结束或猜名字。
@@ -122,6 +124,7 @@ class AnimeTracePlugin(Star):
 
         Args:
             image_index(int): 图片序号，从 1 开始，最多 4；默认 1。
+            reference_message_id(str): 可选的当前会话历史原图消息ID；指定后仅取该消息，不回退其他图片。
         """
         if self._session is None:
             return result_json({"status": "error", "error_code": "plugin_not_initialized"})
@@ -134,7 +137,7 @@ class AnimeTracePlugin(Star):
                                 "guidance": "本次无法识图，不要猜测人物姓名。"})
         return result_json(await self._image_bridge.recognize(
             event, default_model["id"], self._session,
-            self._call_bounded_image_api, image_index))
+            self._call_bounded_image_api, image_index, reference_message_id))
 
 
     async def _call_bounded_image_api(self, jpeg: bytes, model: str) -> dict:
@@ -172,6 +175,7 @@ class AnimeTracePlugin(Star):
             req.system_prompt = (req.system_prompt or "") + (
                 "\n" + marker + "用户要求上传图片以图搜图、查图片出处/原图/作者或相似图时，"
                 "调用 reverse_image_search，将本轮或引用图片上传检索；不得用文字搜索冒充以图搜图。"
+                "需要历史原图时先查询本会话历史，再传真实 reference_message_id；指定失败不使用其他图片。"
                 "上传检索后先回答可能是什么，再给作品、作者、匹配分数与出处；"
                 "必须读取返回的 characters/material/creator 标注，不能只报告引擎名或丢几个链接。"
                 "默认不发相似图片；只有 Pinterest 等相似页面不算识别完成，需继续核实。"
@@ -186,11 +190,13 @@ class AnimeTracePlugin(Star):
 
     @filter.llm_tool(name="reverse_image_search")
     async def reverse_image_search(self, event: AstrMessageEvent,
-                                   image_index: int = 1, max_results: int = 5) -> str:
+                                   image_index: int = 1, max_results: int = 5,
+                                   reference_message_id: str = "") -> str:
         """上传用户图片联网检索，优先返回供文字识别和解释使用的标题、摘要及出处候选。
 
         普通成员可用。用户说“以图搜图”“上传这张图搜索”“找原图/出处/作者”时用此工具。
         实际上传当前消息、明确引用，或同发送者同会话最近5分钟的图片；不是按关键词下载图片。
+        需要历史原图时先查询本会话历史消息，再传 reference_message_id；指定失败不上传其他图片。
         不接受模型指定的URL/文件路径。优先SauceNAO上传检索，匹配不足再查Yandex相似页面。
         无Key、无收费回退；结果含来源链接和搜索结果页。相似不等于最早出处，低相似度不确认身份。
         用户最需要文字结果：先回答图中可能是什么；characters是角色、material是作品、creator是作者，
@@ -202,6 +208,7 @@ class AnimeTracePlugin(Star):
         Args:
             image_index(int): 本条或引用消息的图片序号，1到4，默认1。
             max_results(int): 最多返回的出处候选数量，1到8，默认5。
+            reference_message_id(str): 可选的当前会话历史原图消息ID；指定后仅取该消息，不回退其他图片。
         """
         if (type(image_index) is not int or not 1 <= image_index <= 4
                 or type(max_results) is not int or not 1 <= max_results <= 8):
@@ -209,9 +216,13 @@ class AnimeTracePlugin(Star):
         async with self._reverse_lock:
             if self._reverse_closed or self._session is None:
                 return result_json({"status": "error", "error_code": "plugin_unavailable"})
-            images, origin = await self._image_bridge.select(event)
+            try:
+                images, origin = await self._image_bridge.select(event, reference_message_id)
+            except ValueError as exc:
+                return result_json(selection_error(exc))
             if len(images) < image_index:
-                return result_json({"status": "no_image", "guidance": "请让用户上传或明确引用要以图搜图的图片。"})
+                return result_json({"status": "no_image", "image_source": origin,
+                                    "guidance": NO_IMAGE_GUIDANCE})
             try:
                 async with self._image_bridge.lock:
                     raw = await self._image_bridge._image_bytes(images[image_index - 1], self._session)
@@ -661,6 +672,11 @@ class AnimeTracePlugin(Star):
             if len(results) > 1:
                 lines.append(f"\n第 {idx} 个角色：")
 
+            if item.get("not_confident") is True:
+                lines.append("⚠️ 低置信候选，无法确认人物身份")
+            elif item.get("not_confident") is not False:
+                lines.append("⚠️ 服务未提供置信标记，以下仅为候选")
+
             limit = self.max_characters_per_role
             display_characters = characters[:limit] if limit > 0 else characters
             for i, char in enumerate(display_characters):
@@ -702,8 +718,13 @@ class AnimeTracePlugin(Star):
         if self.result_as_image and crop_items:
             try:
                 card_path = await self._render_result_card(model, crop_items)
+                confidence = "\n".join(dict.fromkeys(
+                    "低置信候选，无法确认人物身份" if item.get("not_confident") is True
+                    else "服务未提供置信标记，以下仅为候选"
+                    for item in data_list if item.get("not_confident") is not False))
                 await event.send(
-                    event.chain_result([Comp.Image.fromFileSystem(card_path)])
+                    event.chain_result(([Comp.Plain(confidence)] if confidence else []) +
+                                       [Comp.Image.fromFileSystem(card_path)])
                 )
                 return
             except Exception as e:
@@ -721,6 +742,11 @@ class AnimeTracePlugin(Star):
             characters = item["characters"]
             if characters:
                 text_lines = []
+                confidence = data_list[item['index'] - 1].get('not_confident')
+                if confidence is True:
+                    text_lines.append("⚠️ 低置信候选，无法确认人物身份")
+                elif confidence is not False:
+                    text_lines.append("⚠️ 服务未提供置信标记，以下仅为候选")
                 if len(crop_items) > 1:
                     text_lines.append(f"第 {item['index']} 个角色：")
 
