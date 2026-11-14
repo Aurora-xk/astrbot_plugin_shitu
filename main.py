@@ -18,7 +18,13 @@ from astrbot.api.star import Context, Star, register
 
 from .card import render_card
 from .crops import collect_crops
-from .image_tool import ImageRecognitionBridge, NO_IMAGE_GUIDANCE, result_json, selection_error
+from .image_tool import (
+    ImageReadError,
+    ImageRecognitionBridge,
+    NO_IMAGE_GUIDANCE,
+    result_json,
+    selection_error,
+)
 from .reverse_search import reverse_search as upload_reverse_search
 
 DEFAULT_CONFIG = {
@@ -223,6 +229,30 @@ class AnimeTracePlugin(Star):
             if len(images) < image_index:
                 return result_json({"status": "no_image", "image_source": origin,
                                     "guidance": NO_IMAGE_GUIDANCE})
+            started = asyncio.get_running_loop().time()
+            phase = "read"
+
+            def failure(exc, code, stage, guidance, http_status=None):
+                # Never include exception text: clients may embed signed image
+                # URLs, proxy credentials, or service response bodies in it.
+                source = origin if origin in {
+                    "current_message", "explicit_reply", "same_sender_recent_5m", "history_message"
+                } else "unknown"
+                status = http_status if type(http_status) is int and 100 <= http_status <= 599 else None
+                payload = {"status": "error", "error_code": code, "stage": stage,
+                           "image_source": source, "image_index": image_index,
+                           "guidance": guidance}
+                if status is not None:
+                    payload["http_status"] = status
+                exception_type = re.sub(r"[^A-Za-z0-9_]", "_", type(exc).__name__)[:80]
+                elapsed = max(0, asyncio.get_running_loop().time() - started)
+                logger.warning(
+                    f"以图搜图失败: stage={stage}, source={source}, "
+                    f"elapsed={elapsed:.2f}s, exception_type={exception_type}, "
+                    f"http_status={status}"
+                )
+                return result_json(payload)
+
             try:
                 async with self._image_bridge.lock:
                     raw = await self._image_bridge._image_bytes(images[image_index - 1], self._session)
@@ -239,14 +269,47 @@ class AnimeTracePlugin(Star):
                         return result_json(result)
                     if now < self._reverse_next_request:
                         return result_json({"status": "cooldown", "guidance": "上传搜图冷却中，请勿本轮立即重复调用。"})
+                    phase = "prepare"
                     jpeg = await self._image_bridge._prepare_with_cancellation(raw)
+                phase = "upload"
                 self._reverse_next_request = asyncio.get_running_loop().time() + 10
                 result = await asyncio.wait_for(upload_reverse_search(jpeg, max_results), timeout=65)
             except asyncio.CancelledError:
                 raise
-            except Exception:
-                return result_json({"status": "error", "error_code": "reverse_image_search_failed",
-                                    "guidance": "图片读取、上传或搜图服务失败，不要声称已找到出处。"})
+            except ImageReadError as exc:
+                code = exc.code if isinstance(exc.code, str) and exc.code in {
+                    "image_download_timeout", "image_download_failed", "image_too_large",
+                    "image_unavailable", "image_source_not_allowed",
+                } else "image_unavailable"
+                stage = exc.stage if isinstance(exc.stage, str) and exc.stage in {"read", "download"} else "read"
+                guidance = (
+                    "原图下载超时，本次尚未上传搜图。可稍后重试或重新发送图片，不要声称已找到出处。"
+                    if code == "image_download_timeout" else
+                    "原图未能读取，本次尚未上传搜图。请引用或重新发送可用图片，不要声称已找到出处。"
+                )
+                return failure(exc, code, stage, guidance, exc.http_status)
+            except asyncio.TimeoutError as exc:
+                if phase == "prepare":
+                    return failure(exc, "image_prepare_timeout", phase,
+                                   "图片处理超时，本次尚未上传搜图。请缩小图片后重试，不要声称已找到出处。")
+                if phase == "upload":
+                    return failure(exc, "reverse_search_timeout", phase,
+                                   "上传或搜图服务超时，本次未取得可信结果，不要声称已找到出处。")
+                return failure(exc, "image_download_timeout", "download",
+                               "原图下载超时，本次尚未上传搜图。可稍后重试或重新发送图片，不要声称已找到出处。")
+            except ValueError as exc:
+                if phase == "prepare":
+                    return failure(exc, "invalid_image", phase,
+                                   "图片无法解码，本次尚未上传搜图。请换成常见图片格式后重试，不要声称已找到出处。")
+                code = "image_unavailable" if phase == "read" else "reverse_image_search_failed"
+                return failure(exc, code, phase,
+                               "图片读取、上传或搜图服务失败，不要声称已找到出处。")
+            except Exception as exc:
+                code = {"read": "image_unavailable", "prepare": "image_prepare_failed"}.get(
+                    phase, "reverse_image_search_failed"
+                )
+                return failure(exc, code, phase,
+                               "图片读取、上传或搜图服务失败，不要声称已找到出处。")
             if self._reverse_closed:
                 return result_json({"status": "error", "error_code": "plugin_unavailable"})
             result.update(image_source=origin, image_index=image_index)

@@ -7,7 +7,9 @@ import hashlib
 import ipaddress
 import json
 import math
+import os
 import re
+import stat
 import time
 import warnings
 from collections import OrderedDict
@@ -30,6 +32,12 @@ from astrbot.core.utils.astrbot_path import (
 MAX_BYTES = 8 * 1024 * 1024
 MAX_PIXELS = 16_000_000
 MAX_IMAGES = 4
+DOWNLOAD_TOTAL_TIMEOUT = 45
+DOWNLOAD_CONNECT_TIMEOUT = 10
+DOWNLOAD_READ_TIMEOUT = 20
+DOWNLOAD_CACHE_TTL = 300
+DOWNLOAD_CACHE_CAPACITY = 16
+DOWNLOAD_CACHE_BYTES = 16 * 1024 * 1024
 GUIDANCE = (
     "以下只是 AnimeTrace 数据库候选，不是身份确认。保留 not_confident；"
     "true 或缺失时必须说明不确定。无命中或服务故障时说无法确认，"
@@ -41,6 +49,23 @@ NO_IMAGE_GUIDANCE = (
     "可用的历史查询工具找到含图消息的真实消息ID，再以 reference_message_id 调用本工具；"
     "引用机器人文字回复不等于引用原图。历史也无法取得原图时，再请用户引用或重发。"
 )
+
+
+class ImageReadError(ValueError):
+    """Safe read failure metadata; never retain paths or signed source URLs."""
+
+    CODES = frozenset({
+        "image_unavailable", "image_source_not_allowed", "image_too_large",
+        "image_download_failed", "image_download_timeout",
+    })
+
+    def __init__(self, code, stage="read", http_status=None):
+        self.code = code if isinstance(code, str) and code in self.CODES else "image_unavailable"
+        self.stage = stage if isinstance(stage, str) and stage in {"read", "download"} else "read"
+        self.http_status = (
+            http_status if type(http_status) is int and 100 <= http_status <= 599 else None
+        )
+        super().__init__(self.code)
 
 
 def selection_error(exc):
@@ -90,6 +115,7 @@ class ImageRecognitionBridge:
         self.clock = clock
         self.recent = OrderedDict()
         self.results = OrderedDict()
+        self.downloads = OrderedDict()
         self.lock = asyncio.Lock()
         self.next_request = 0
         self.recent_ttl = 300
@@ -98,6 +124,9 @@ class ImageRecognitionBridge:
         self.capacity = 128
         self.recent_byte_budget = 1024 * 1024
         self.recent_entry_budget = 64 * 1024
+        self.download_ttl = DOWNLOAD_CACHE_TTL
+        self.download_capacity = DOWNLOAD_CACHE_CAPACITY
+        self.download_byte_budget = DOWNLOAD_CACHE_BYTES
         self.local_roots = tuple(Path(p).resolve() for p in (local_roots or [
             get_astrbot_temp_path(), get_astrbot_webchat_path(), get_astrbot_system_tmp_path(),
             Path(get_astrbot_data_path()) / "attachments",
@@ -119,6 +148,25 @@ class ImageRecognitionBridge:
                 cache.popitem(last=False)
         while sum(value[2] for value in self.recent.values()) > self.recent_byte_budget:
             self.recent.popitem(last=False)
+        self._prune_downloads()
+
+    def _prune_downloads(self):
+        now = self.clock()
+        for key, (expires, _) in list(self.downloads.items()):
+            if expires <= now:
+                del self.downloads[key]
+        while (len(self.downloads) > self.download_capacity or
+               sum(len(value[1]) for value in self.downloads.values()) > self.download_byte_budget):
+            self.downloads.popitem(last=False)
+
+    def _remember_download(self, key, raw):
+        # No URL is retained, and incomplete, empty, or oversized bodies never enter
+        # this cache. Full URL hashing deliberately preserves signed query identity.
+        if not raw or len(raw) > MAX_BYTES:
+            return
+        self.downloads[key] = (self.clock() + self.download_ttl, raw)
+        self.downloads.move_to_end(key)
+        self._prune_downloads()
 
     def remember(self, event):
         """Keep components only; ordinary messages do not download or upload images."""
@@ -251,28 +299,94 @@ class ImageRecognitionBridge:
                 raise ValueError("image_source_not_allowed")
         return value
 
+    def _read_local_bytes(self, value):
+        try:
+            path = self._safe_local(value)
+            # Resolve first for root checks and refuse a subsequently substituted
+            # final symlink. The descriptor size and bounded read protect against
+            # a file growing after the initial path validation.
+            flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+            fd = os.open(path, flags)
+            with os.fdopen(fd, "rb") as image_file:
+                info = os.fstat(image_file.fileno())
+                if not stat.S_ISREG(info.st_mode):
+                    raise ImageReadError("image_source_not_allowed")
+                if info.st_size > MAX_BYTES:
+                    raise ImageReadError("image_too_large")
+                raw = image_file.read(MAX_BYTES + 1)
+            if len(raw) > MAX_BYTES:
+                raise ImageReadError("image_too_large")
+            return raw
+        except ImageReadError:
+            raise
+        except ValueError as exc:
+            code = str(exc) if str(exc) in ImageReadError.CODES else "image_unavailable"
+            raise ImageReadError(code) from None
+        except (OSError, RuntimeError):
+            raise ImageReadError("image_unavailable") from None
+
     async def _image_bytes(self, component, session):
+        self._prune_downloads()
         source = component.url or component.file or ""
+        remote_source = isinstance(source, str) and source.startswith(("http://", "https://"))
+        # Reuse only an explicit local reference carried by this selected image.
+        # No filename search, URL normalization, or other plugin's cache is used.
+        local_error = None
+        for value in (getattr(component, "path", None), getattr(component, "file", None)):
+            if not isinstance(value, str) or not value:
+                continue
+            if not value.startswith("file://") and not Path(value).is_absolute():
+                continue
+            try:
+                return self._read_local_bytes(value)
+            except ImageReadError as exc:
+                local_error = exc
         if not isinstance(source, str) or not source:
-            raise ValueError("image_unavailable")
-        if source.startswith(("http://", "https://")):
-            self._safe_url(source)
+            raise local_error or ImageReadError("image_unavailable")
+        if remote_source:
+            try:
+                self._safe_url(source)
+            except (ValueError, TypeError):
+                raise ImageReadError("image_source_not_allowed") from None
+            cache_key = hashlib.sha256(source.encode()).hexdigest()
+            cached = self.downloads.get(cache_key)
+            if cached:
+                self.downloads.move_to_end(cache_key)
+                return cached[1]
             # AstrBot's remote convert_to_file_path downloads without a size bound.
-            # For real remote message components only, enforce the bound ourselves.
-            async with session.get(source, allow_redirects=False,
-                                   timeout=aiohttp.ClientTimeout(total=15)) as response:
-                if response.status != 200:
-                    raise ValueError("image_download_failed")
-                if response.content_length and response.content_length > MAX_BYTES:
-                    raise ValueError("image_too_large")
-                chunks = []
-                size = 0
-                async for chunk in response.content.iter_chunked(64 * 1024):
-                    size += len(chunk)
-                    if size > MAX_BYTES:
-                        raise ValueError("image_too_large")
-                    chunks.append(chunk)
-                return b"".join(chunks)
+            # Keep connect/read bounds while allowing a temporary slow transfer.
+            http_status = None
+            try:
+                async with session.get(
+                    source, allow_redirects=False,
+                    timeout=aiohttp.ClientTimeout(
+                        total=DOWNLOAD_TOTAL_TIMEOUT,
+                        connect=DOWNLOAD_CONNECT_TIMEOUT,
+                        sock_connect=DOWNLOAD_CONNECT_TIMEOUT,
+                        sock_read=DOWNLOAD_READ_TIMEOUT,
+                    ),
+                ) as response:
+                    http_status = response.status
+                    if response.status != 200:
+                        raise ImageReadError("image_download_failed", "download", http_status)
+                    if response.content_length and response.content_length > MAX_BYTES:
+                        raise ImageReadError("image_too_large", "download", http_status)
+                    chunks = []
+                    size = 0
+                    async for chunk in response.content.iter_chunked(64 * 1024):
+                        size += len(chunk)
+                        if size > MAX_BYTES:
+                            raise ImageReadError("image_too_large", "download", http_status)
+                        chunks.append(chunk)
+                    raw = b"".join(chunks)
+            except ImageReadError:
+                raise
+            except TimeoutError:
+                raise ImageReadError("image_download_timeout", "download", http_status) from None
+            except aiohttp.ClientError:
+                raise ImageReadError("image_download_failed", "download", http_status) from None
+            self._remember_download(cache_key, raw)
+            return raw
         if source.startswith("base64://"):
             encoded = source[9:]
         elif source.startswith("data:image/") and ";base64," in source[:100]:
@@ -281,24 +395,15 @@ class ImageRecognitionBridge:
             encoded = None
         if encoded is not None:
             if len(encoded) > (MAX_BYTES + 2) // 3 * 4:
-                raise ValueError("image_too_large")
+                raise ImageReadError("image_too_large")
             try:
                 raw = base64.b64decode(encoded, validate=True)
             except Exception:
-                raise ValueError("image_unavailable") from None
+                raise ImageReadError("image_unavailable") from None
             if len(raw) > MAX_BYTES:
-                raise ValueError("image_too_large")
+                raise ImageReadError("image_too_large")
             return raw
-        # Validate before asking AstrBot to resolve; never open arbitrary host files.
-        path = self._safe_local(source)
-        converted = await asyncio.wait_for(component.convert_to_file_path(), timeout=5)
-        if self._safe_local(converted) != path:
-            raise ValueError("image_source_not_allowed")
-        with path.open("rb") as image_file:
-            raw = image_file.read(MAX_BYTES + 1)
-        if len(raw) > MAX_BYTES:
-            raise ValueError("image_too_large")
-        return raw
+        return self._read_local_bytes(source)
 
     @staticmethod
     def _prepare(raw):
@@ -386,6 +491,11 @@ class ImageRecognitionBridge:
                                "available_images": len(images), "model": model})
                 return result
             jpeg = await self._prepare_with_cancellation(raw)
+        except ImageReadError as exc:
+            result = {"status": "error", "error_code": exc.code,
+                      "stage": exc.stage, "guidance": GUIDANCE}
+            if exc.http_status is not None:
+                result["http_status"] = exc.http_status
         except asyncio.TimeoutError:
             result = {"status": "error", "error_code": "image_timeout", "guidance": GUIDANCE}
         except Exception as exc:
@@ -423,6 +533,7 @@ class ImageRecognitionBridge:
     def clear(self):
         self.recent.clear()
         self.results.clear()
+        self.downloads.clear()
 
 
 def result_json(result):
